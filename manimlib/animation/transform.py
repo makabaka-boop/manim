@@ -9,13 +9,14 @@ from manimlib.constants import DEG
 from manimlib.constants import OUT
 from manimlib.mobject.mobject import Group
 from manimlib.mobject.mobject import Mobject
+from manimlib.mobject.types.vectorized_mobject import VMobject
 from manimlib.utils.paths import path_along_arc
 from manimlib.utils.paths import straight_path
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Callable
+    from typing import Callable, Iterable, Sequence
     import numpy.typing as npt
     from manimlib.scene.scene import Scene
     from manimlib.typing import ManimColor
@@ -324,3 +325,259 @@ class CyclicReplace(Transform):
 class Swap(CyclicReplace):
     """Alternate name for CyclicReplace"""
     pass
+
+
+class AnchorMatchedTransform(Transform):
+    """Transform one closed outline into another with explicit anchor correspondences.
+
+    An ordinary :class:`Transform` lines the two point lists up from their first
+    point and pads the shorter path, so changing where either contour starts, or
+    how its curves are cut into pieces, can have a corner of the starting outline
+    slide along an edge of the target one on the way there. This class lets the
+    caller say which anchors correspond instead.
+
+    Both mobjects must be single planar closed :class:`VMobject` outlines with one
+    uniform stroke. ``anchor_pairs`` is a list of ``(index, target_index)`` pairs,
+    indexing the anchors of each contour along its own path order, starting at 0.
+    The anchor closing a path back onto its first point is the same point and is
+    not counted again. The pairs may start at any anchor and run around either
+    contour once in its path order. Each paired anchor is then taken straight to
+    its counterpart, and the curves between two consecutive pairs deform together
+    as one interval even when the two sides cut that interval into different
+    numbers of curves.
+
+    At the start and end the two original outlines and styles are kept (the target
+    mobject itself is never modified, alignment is done to a copy), and leaving
+    ``anchor_pairs`` as ``None`` gives an ordinary :class:`Transform`.
+
+    An out of range index, an anchor used in more than one pair, or pairs which do
+    not follow path order raise a ``ValueError`` in :meth:`begin`, before either
+    contour is touched, so the scene is left showing the original.
+    """
+    def __init__(
+        self,
+        mobject: VMobject,
+        target_mobject: VMobject | None = None,
+        anchor_pairs: Iterable[tuple[int, int]] | None = None,
+        path_arc: float | Tuple[float, float] = 0.0,
+        path_arc_axis: np.ndarray = OUT,
+        path_func: Callable | None = None,
+        **kwargs
+    ):
+        self.anchor_pairs = (
+            None if anchor_pairs is None else [tuple(pair) for pair in anchor_pairs]
+        )
+        super().__init__(
+            mobject, target_mobject,
+            path_arc=path_arc,
+            path_arc_axis=path_arc_axis,
+            path_func=path_func,
+            **kwargs
+        )
+
+    def begin(self) -> None:
+        self.target_mobject = self.create_target()
+        self.check_target_mobject_validity()
+        if self.anchor_pairs is None:
+            # No correspondence asked for: align in the usual way
+            self.align_default()
+            Animation.begin(self)
+            return
+
+        # Validate before either contour is touched, so a bad call leaves the
+        # scene showing the original
+        anchor_counts = [
+            self.check_contour_is_eligible(mob)
+            for mob in [self.mobject, self.target_mobject]
+        ]
+        pairs = self.check_anchor_pairs(self.anchor_pairs, anchor_counts)
+
+        self.target_copy = self.target_mobject.copy()
+        self.align_by_anchor_pairs(self.mobject, self.target_copy, pairs)
+        Animation.begin(self)
+
+    def align_default(self) -> None:
+        if self.mobject.is_aligned_with(self.target_mobject):
+            # Nothing to align, so nothing is done to the target and it can stand as it is
+            self.target_copy = self.target_mobject
+        else:
+            # Work on a copy of the target so the actual target stays preserved
+            self.target_copy = self.target_mobject.copy()
+            self.mobject.align_data_and_family(self.target_copy)
+
+    @staticmethod
+    def check_contour_is_eligible(mobject: VMobject) -> int:
+        """The number of anchors a single closed outline counts, or an error."""
+        if not isinstance(mobject, VMobject):
+            raise ValueError(
+                "AnchorMatchedTransform only transforms VMobject outlines"
+            )
+        if len(mobject.submobjects) > 0:
+            raise ValueError(
+                "AnchorMatchedTransform only applies to a single outline with no "
+                "submobjects, not a family of them"
+            )
+        if not mobject.has_points():
+            raise ValueError(
+                "AnchorMatchedTransform needs an outline holding points"
+            )
+        points = mobject.get_points()
+        if len(points) < 7 or len(points) % 2 != 1:
+            raise ValueError(
+                "AnchorMatchedTransform needs a closed outline of at least three anchors"
+            )
+        if len(mobject.get_subpaths()) != 1:
+            raise ValueError(
+                "AnchorMatchedTransform needs one single closed subpath"
+            )
+        if not mobject.is_closed():
+            raise ValueError(
+                "AnchorMatchedTransform only applies to closed contours"
+            )
+        if not np.allclose(points[:, 2], points[0, 2], atol=1e-6):
+            raise ValueError(
+                "AnchorMatchedTransform only applies to planar contours"
+            )
+        if not mobject.has_stroke():
+            raise ValueError(
+                "AnchorMatchedTransform only applies to contours with a stroke"
+            )
+        widths = mobject.data["stroke_width"][:, 0]
+        rgba = mobject.data["stroke_rgba"]
+        if not np.allclose(widths, widths[0], atol=1e-6):
+            raise ValueError(
+                "AnchorMatchedTransform needs one uniform stroke width; found "
+                "varying widths along the contour"
+            )
+        if not np.allclose(rgba, rgba[0], atol=1e-6):
+            raise ValueError(
+                "AnchorMatchedTransform needs one uniform stroke color; found "
+                "varying colors along the contour"
+            )
+        # For a closed point list [a0, h0, ..., a_{n-1}, h_{n-1}, a0] the last
+        # anchor is the first one over again, so it is not counted twice
+        return (len(points) - 1) // 2
+
+    @staticmethod
+    def check_anchor_pairs(
+        anchor_pairs: Sequence[tuple[int, int]],
+        anchor_counts: Sequence[int],
+    ) -> list[tuple[int, int]]:
+        if len(anchor_pairs) == 0:
+            raise ValueError("anchor_pairs is empty; pass None for an ordinary Transform")
+
+        pairs = []
+        for pair in anchor_pairs:
+            if len(pair) != 2 or not all(isinstance(i, (int, np.integer)) for i in pair):
+                raise ValueError(
+                    f"Each entry of anchor_pairs must be a pair of int indices, "
+                    f"not {pair}"
+                )
+            pairs.append((int(pair[0]), int(pair[1])))
+
+        for side, count in enumerate(anchor_counts):
+            for pair in pairs:
+                index = pair[side]
+                if not 0 <= index < count:
+                    raise ValueError(
+                        f"Anchor index {index} is out of range for a closed contour "
+                        f"with {count} anchor{'s' if count != 1 else ''}"
+                    )
+
+        source_indices = [pair[0] for pair in pairs]
+        target_indices = [pair[1] for pair in pairs]
+        for name, indices in [("source", source_indices), ("target", target_indices)]:
+            repeated = {i for i in indices if indices.count(i) > 1}
+            if repeated:
+                raise ValueError(
+                    f"{name} anchor {sorted(repeated)[0]} is used more than once in "
+                    f"anchor_pairs; each anchor may be paired at most once"
+                )
+            count = anchor_counts[0] if name == "source" else anchor_counts[1]
+            # Rotate so the first listed anchor sits at 0. The offsets must then
+            # strictly grow, which is exactly "around once in path order"
+            offsets = [(index - indices[0]) % count for index in indices]
+            if any(offsets[i + 1] <= offsets[i] for i in range(len(offsets) - 1)):
+                raise ValueError(
+                    f"The {name} anchor indices {tuple(indices)} do not run in path "
+                    f"order around the contour starting from the first pair"
+                )
+        return pairs
+
+    @staticmethod
+    def cyclic_subpath(
+        points: np.ndarray,
+        start_anchor: int,
+        end_anchor: int,
+        n_anchors: int,
+    ) -> np.ndarray:
+        """Points of one closed contour from one anchor forward to another.
+
+        The closing anchor repeats the first, so the base list is tiled twice and
+        the wanted run is read out of it. Result length is ``2 * n_curves + 1``.
+        """
+        n_curves = (end_anchor - start_anchor) % n_anchors
+        base = points[:-1]
+        tiled = np.vstack([base, base])
+        start = 2 * start_anchor
+        result = tiled[start:start + 2 * n_curves + 1].copy()
+        result.setflags(write=True)
+        return result
+
+    @classmethod
+    def align_by_anchor_pairs(
+        cls,
+        source: VMobject,
+        target: VMobject,
+        pairs: Sequence[tuple[int, int]],
+    ) -> None:
+        """Re-cut the two closed paths so paired anchors share an array index.
+
+        Each interval between consecutive pairs is aligned on its own: whichever
+        side traces it with fewer curves is subdivided to match, so an interval
+        only ever mixes with its matching interval, however differently the two
+        sides cut their curves.
+        """
+        source_points = source.get_points()
+        target_points = target.get_points()
+        n_source = (len(source_points) - 1) // 2
+        n_target = (len(target_points) - 1) // 2
+
+        source_pieces = []
+        target_pieces = []
+        n_pairs = len(pairs)
+        for i, (source_anchor, target_anchor) in enumerate(pairs):
+            next_source, next_target = pairs[(i + 1) % n_pairs]
+            source_piece = cls.cyclic_subpath(
+                source_points, source_anchor, next_source, n_source
+            )
+            target_piece = cls.cyclic_subpath(
+                target_points, target_anchor, next_target, n_target
+            )
+            source_curves = (len(source_piece) - 1) // 2
+            target_curves = (len(target_piece) - 1) // 2
+            if source_curves < target_curves:
+                source_piece = source.insert_n_curves_to_point_list(
+                    target_curves - source_curves, source_piece
+                )
+            elif target_curves < source_curves:
+                target_piece = target.insert_n_curves_to_point_list(
+                    source_curves - target_curves, target_piece
+                )
+            source_pieces.append(source_piece)
+            target_pieces.append(target_piece)
+
+        new_source_points = np.vstack([
+            source_pieces[0],
+            *[piece[1:] for piece in source_pieces[1:]],
+        ])
+        new_target_points = np.vstack([
+            target_pieces[0],
+            *[piece[1:] for piece in target_pieces[1:]],
+        ])
+        assert len(new_source_points) == len(new_target_points)
+
+        # set_points resizes the per-point style rows with order preserved, which
+        # for a uniform stroke leaves them uniform, and refreshes subpath data
+        source.set_points(new_source_points)
+        target.set_points(new_target_points)
