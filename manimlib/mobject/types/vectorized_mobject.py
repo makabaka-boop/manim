@@ -45,6 +45,7 @@ from manimlib.utils.space_ops import normalize
 from manimlib.utils.space_ops import rotation_between_vectors
 from manimlib.utils.space_ops import rotation_matrix_transpose
 from manimlib.utils.space_ops import poly_line_length
+from manimlib.utils.space_ops import winding_number_about_point
 from manimlib.renderer.drawing import VDrawing
 from manimlib.renderer.uniform_block import COMMON_UNIFORMS
 from manimlib.renderer.uniform_block import uniform_block_dtype
@@ -1117,6 +1118,24 @@ class VMobject(Mobject):
                 (sums[:, 0] * diffs[:, 1]).sum(),  # Add up (x0 + x1)*(y1 - y0)
             ])
         return area
+
+    def get_winding_number_about(self, point: Vect3) -> int:
+        """
+        The winding number of the path around the point, summed over its subpaths under
+        the nonzero winding rule, which is what decides whether a drawn fill covers the
+        point: a hole traced in the opposite sense winds back to zero. The point is read
+        in the plane the path's own points live in, so only its first two coordinates
+        enter.
+        """
+        return winding_number_about_point(point, self.get_subpaths())
+
+    def point_is_in_fill(self, point: Vect3) -> bool:
+        """
+        Whether a fill drawn under the same nonzero winding rule the fill shader uses
+        would cover the point. Only the path is consulted, not the fill's color or
+        opacity, so a fully transparent fill still reports its region.
+        """
+        return self.get_winding_number_about(point) != 0
 
     def get_unit_normal(self, refresh: bool = False) -> Vect3:
         if self.get_num_points() < 3:

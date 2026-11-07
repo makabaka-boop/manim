@@ -417,6 +417,103 @@ def get_winding_number(points: Sequence[Vect2 | Vect3]) -> float:
     return total_angle / TAU
 
 
+def winding_number_about_point(
+    point: Vect2 | Vect3,
+    paths: Sequence[Vect2Array | Vect3Array],
+    tol: float = 1e-8,
+) -> int:
+    """
+    The winding number of quadratic-bezier paths around a point, summed over the paths,
+    under the nonzero winding rule a fill is drawn with: a ray leaving the point counts
+    one for each path crossing it upward and minus one for each crossing downward, and a
+    nonzero total is what marks the point as inside, so a hole wound the other way winds
+    back to zero and a self crossing can wind twice.
+
+    Each path holds alternating anchor and handle points, anchors at the even indices,
+    in the layout a VMobject stores its points. anchors[0] and anchors[-1] agree on a
+    closed path; an open one is closed by the straight chord back, as the fan of a fill
+    closes it when drawn.
+    """
+    px, py = float(point[0]), float(point[1])
+    # Roots sitting within this of a curve end are taken to belong to the anchor there
+    t_eps = 1e-9
+    total = 0
+    for path in paths:
+        pts = np.asarray(path, dtype=float)
+        if len(pts) < 3:
+            continue
+        pts = pts[:, :2]
+        closed = bool(np.allclose(pts[0], pts[-1], atol=tol, rtol=0))
+
+        # The vertices the anchor rule walks around. A closed path repeats its first
+        # anchor at its end, so with that one dropped every vertex is counted once
+        vertices = pts[:-1:2] if closed else pts[0::2]
+        n_vertices = len(vertices)
+        if n_vertices < 3:
+            continue
+
+        # Crossings which land exactly on a vertex. The two curves meeting there count
+        # as one crossing when they come at the ray from opposite sides, and as none, a
+        # touch and turn back, when from the same side, decided against the neighbouring
+        # vertices as in the polygon vertex rule
+        yv = vertices[:, 1]
+        on_ray = np.abs(yv - py) < tol
+        if on_ray.any():
+            j = np.flatnonzero(on_ray)
+            y_prev = yv[(j - 1) % n_vertices]
+            y_next = yv[(j + 1) % n_vertices]
+            to_the_right = vertices[j, 0] > px
+            upward = to_the_right & (y_prev <= py) & (y_next > py)
+            downward = to_the_right & (y_prev > py) & (y_next <= py)
+            total += int(upward.sum() - downward.sum())
+
+        # The remaining crossings are roots of the y-coordinate of each quadratic.
+        # p0, p1, p2 hold the first anchor, the handle and the second anchor
+        p0 = pts[0:-2:2]
+        p1 = pts[1:-1:2]
+        p2 = pts[2::2]
+        if not closed:
+            # The straight chord a fill's fan closes an open path with
+            p0 = np.vstack([p0, pts[-1]])
+            p1 = np.vstack([p1, 0.5 * (pts[-1] + pts[0])])
+            p2 = np.vstack([p2, pts[0]])
+
+        y0, y1, y2 = p0[:, 1], p1[:, 1], p2[:, 1]
+        a = y0 - 2 * y1 + y2
+        b = 2 * (y1 - y0)
+        c = y0 - py
+        for i in range(len(p0)):
+            roots = []
+            if abs(a[i]) < 1e-12:
+                if abs(b[i]) > 1e-12:
+                    t = -c[i] / b[i]
+                    if 0.0 <= t <= 1.0:
+                        roots.append(t)
+            else:
+                discriminant = b[i] ** 2 - 4 * a[i] * c[i]
+                if discriminant > 0.0:
+                    root = np.sqrt(discriminant)
+                    roots.extend(t for t in (
+                        (-b[i] - root) / (2 * a[i]),
+                        (-b[i] + root) / (2 * a[i]),
+                    ) if 0.0 <= t <= 1.0)
+                # A zero discriminant is a grazing touch, which crosses nothing
+            for t in roots:
+                # Leave a crossing at an anchor to the vertex rule above
+                if t <= t_eps and abs(y0[i] - py) <= tol:
+                    continue
+                if t >= 1.0 - t_eps and abs(y2[i] - py) <= tol:
+                    continue
+                x = (1 - t) ** 2 * p0[i, 0] + 2 * (1 - t) * t * p1[i, 0] + t ** 2 * p2[i, 0]
+                if x <= px:
+                    continue
+                slope = 2 * a[i] * t + b[i]
+                if abs(slope) < 1e-12:
+                    continue
+                total += 1 if slope > 0 else -1
+    return total
+
+
 ##
 
 def cross2d(a: Vect2 | Vect2Array, b: Vect2 | Vect2Array) -> Vect2 | Vect2Array:

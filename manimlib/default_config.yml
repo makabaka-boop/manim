@@ -141,6 +141,8 @@ key_bindings:
   color: "c"
   information: "i"
   cursor: "k"
+  # Command plus this toggles whether a tap selects by bounding box or by filled region
+  fill_region_select: "b"
 colors:
   blue_e: "#1C758A"
   blue_d: "#29ABCA"

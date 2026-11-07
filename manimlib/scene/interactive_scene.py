@@ -30,6 +30,7 @@ from manimlib.scene.scene import Scene
 from manimlib.scene.scene import SceneState
 from manimlib.utils.family_ops import extract_mobject_family_members
 from manimlib.utils.space_ops import get_norm
+from manimlib.utils.space_ops import winding_number_about_point
 from manimlib.utils.tex_file_writing import LatexError
 
 from typing import TYPE_CHECKING
@@ -49,6 +50,7 @@ RESIZE_KEY = manim_config.key_bindings.resize  # TODO
 COLOR_KEY = manim_config.key_bindings.color
 INFORMATION_KEY = manim_config.key_bindings.information
 CURSOR_KEY = manim_config.key_bindings.cursor
+FILL_REGION_SELECT_KEY = manim_config.key_bindings.fill_region_select
 
 # For keyboard interactions
 
@@ -64,6 +66,11 @@ class InteractiveScene(Scene):
 
     Pressing command + t will toggle between modes where you either select top level
     mobjects part of the scene, or low level pieces.
+
+    Pressing command + b will toggle tap selection between bounding boxes and filled
+    regions: with it on, a tap picks only what is actually painted under the cursor by
+    the nonzero winding rule, so the hole in a ring and the gaps in a group leave alone
+    whatever is beneath them.
 
     Hold 'g' to grab the selection and move it around
     Hold 'h' to drag it constrained in the horizontal direction
@@ -119,6 +126,9 @@ class InteractiveScene(Scene):
             self.camera.frame
         ]
         self.select_top_level_mobs = True
+        # When true, a tap picks the fill under the cursor by its nonzero winding
+        # region rather than the mobject's bounding box, see gather_new_selection
+        self.fill_region_selection = False
         self.regenerate_selection_search_set()
 
         self.is_selecting = False
@@ -250,6 +260,111 @@ class InteractiveScene(Scene):
         self.select_top_level_mobs = not self.select_top_level_mobs
         self.refresh_selection_scope()
         self.regenerate_selection_search_set()
+
+    def toggle_fill_region_selection(self):
+        self.fill_region_selection = not self.fill_region_selection
+
+    def fill_region_selection_is_active(self) -> bool:
+        """
+        A fill region can be picked straight from the winding of its xy path only while
+        the frame is head on, since once the view is tilted the screen no longer maps
+        onto that plane.
+        """
+        if not self.fill_region_selection:
+            return False
+        rotation = self.frame.get_inverse_camera_rotation_matrix()
+        return bool(np.allclose(rotation, np.eye(3), atol=1e-8))
+
+    def get_cursor_fixed_frame_point(self) -> Vect3:
+        """
+        Where the cursor is in fixed frame coordinates, worked out from where the
+        pointer sits now rather than where it last moved, so a pan or zoom in the
+        meantime still picks what is shown under it.
+        """
+        if self.window is not None:
+            point = self.window.pixel_coords_to_space_coords(
+                *self.window.pointer_position
+            )
+        else:
+            point = self.mouse_point.get_center()
+        return self.frame.to_fixed_frame_point(point)
+
+    def is_fill_pickable(self, mobject: Mobject) -> bool:
+        """
+        Whether what this mobject paints is exactly the nonzero winding region of its
+        path: a closed VMobject lying flat on the z=0 plane, with one uniform,
+        nontransparent fill, which nothing clips and which no depth test reorders.
+        """
+        if not isinstance(mobject, VMobject) or not mobject.has_points():
+            return False
+        if mobject.shader_code_replacements:
+            return False
+        if not mobject.has_fill() or mobject.has_fill_gradient():
+            return False
+        if mobject.depth_test:
+            return False
+        if any(
+            np.any(mobject.uniforms[f"clip_plane{n}"])
+            for n in range(4)
+        ):
+            return False
+        if not np.allclose(mobject.get_points()[:, 2], 0.0, atol=1e-6):
+            return False
+        for subpath in mobject.get_subpaths():
+            if not mobject.consider_points_equal(subpath[0], subpath[-1]):
+                return False
+        return True
+
+    def fill_region_covers(self, mobject: Mobject, point_ff: Vect3) -> bool:
+        """
+        Whether a fixed frame point lies within the region this mobject currently
+        paints its fill over, counted by the same nonzero winding rule the fill shader
+        draws by. A transparent fill and a stroke paint nothing here, so neither counts.
+        """
+        if not self.is_fill_pickable(mobject):
+            return False
+        if mobject.is_fixed_in_frame():
+            paths = mobject.get_subpaths()
+        else:
+            # The same view transform the shader applies before drawing
+            view = self.frame.get_view_matrix()
+            paths = []
+            for subpath in mobject.get_subpaths():
+                points = np.ones((len(subpath), 4))
+                points[:, :3] = subpath
+                paths.append(np.dot(points, view.T)[:, :3])
+        xy = np.vstack(paths)[:, :2]
+        mins, maxs = xy.min(0), xy.max(0)
+        if (maxs < point_ff[:2]).any() or (mins > point_ff[:2]).any():
+            return False
+        return winding_number_about_point(point_ff, paths) != 0
+
+    def point_to_mobject_by_fill(
+        self,
+        point_ff: Vect3,
+        search_set: list[Mobject] | None = None,
+    ) -> Mobject | None:
+        """
+        The topmost selectable mobject whose fill actually covers the fixed frame point.
+        Whatever paints nothing there, a ring's hole or the gap between a group's pieces,
+        is seen straight through to what is beneath. In top level mode the top level
+        object holding the painted piece is returned; in piece mode the piece itself.
+        """
+        if search_set is None:
+            search_set = self.get_selection_search_set()
+        for mobject in reversed(search_set):
+            if self.select_top_level_mobs:
+                leaves = (
+                    submob
+                    for submob in reversed(mobject.family_members_with_points())
+                    if isinstance(submob, VMobject)
+                )
+                if any(self.fill_region_covers(submob, point_ff) for submob in leaves):
+                    return mobject
+            elif isinstance(mobject, VMobject):
+                if self.fill_region_covers(mobject, point_ff):
+                    return mobject
+        return None
 
     def get_selection_search_set(self) -> list[Mobject]:
         return self.selection_search_set
@@ -411,18 +526,29 @@ class InteractiveScene(Scene):
             additions = []
             rect_bb = self.selection_rectangle.get_bounding_box()
             buff = 1e-2
-            for mob in reversed(self.get_selection_search_set()):
-                mob_bb = mob.get_bounding_box()
-                ff_min = self.frame.to_fixed_frame_point(mob_bb[0])
-                ff_max = self.frame.to_fixed_frame_point(mob_bb[2])
-                is_in_selection = not any((
-                    (ff_max < rect_bb[0] - buff).any(),
-                    (ff_min > rect_bb[2] + buff).any(),
-                ))
-                if is_in_selection:
-                    additions.append(mob)
-                    if self.selection_rectangle.get_arc_length() < 1e-2:
-                        break
+            is_tap = self.selection_rectangle.get_arc_length() < 1e-2
+            if is_tap and self.fill_region_selection_is_active():
+                # A tap switches only the one thing actually painted under the cursor,
+                # and where nothing is painted the selection is left as it was
+                picked = self.point_to_mobject_by_fill(
+                    self.get_cursor_fixed_frame_point(),
+                    search_set=self.get_selection_search_set(),
+                )
+                if picked is not None:
+                    additions.append(picked)
+            else:
+                for mob in reversed(self.get_selection_search_set()):
+                    mob_bb = mob.get_bounding_box()
+                    ff_min = self.frame.to_fixed_frame_point(mob_bb[0])
+                    ff_max = self.frame.to_fixed_frame_point(mob_bb[2])
+                    is_in_selection = not any((
+                        (ff_max < rect_bb[0] - buff).any(),
+                        (ff_min > rect_bb[2] + buff).any(),
+                    ))
+                    if is_in_selection:
+                        additions.append(mob)
+                        if is_tap:
+                            break
             self.toggle_from_selection(*additions)
 
     def prepare_grab(self):
@@ -517,6 +643,8 @@ class InteractiveScene(Scene):
             self.ungroup_selection()
         elif char == "t" and (modifiers & Mods.CTRL_OR_CMD):
             self.toggle_selection_mode()
+        elif char == FILL_REGION_SELECT_KEY and (modifiers & Mods.CTRL_OR_CMD):
+            self.toggle_fill_region_selection()
         elif char == "d" and (modifiers & Mods.SHIFT):
             self.copy_frame_positioning()
         elif char == "c" and (modifiers & Mods.SHIFT):
